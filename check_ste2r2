@@ -1,0 +1,112 @@
+#!/bin/bash
+
+# Default values
+HOST=""
+PORT=161
+WARNING=""
+CRITICAL=""
+COMMUNITY="public"
+KEYWORD=""
+SENSOR="1"
+
+# Maximum number of sensors
+MAX_SENSORS=2
+
+# Script information
+script="check_ste2r2"
+version="1.0.0"
+author="John Gonzalez"
+
+# OID bases
+declare -A OID_BASES
+OID_BASES=(['temperature']='1.3.6.1.4.1.21796.4.9.3.1.4.' ['temperatureUnit']='1.3.6.1.4.1.21796.4.9.3.1.7.' ['sensorState']='1.3.6.1.4.1.21796.4.9.3.1.3.' ['sensorID']='1.3.6.1.4.1.21796.4.9.3.1.8.' ['sensorName']='1.3.6.1.4.1.21796.4.9.3.1.2.')
+
+# Script usage
+usage() {
+  echo "Usage: $0 -H host [-p <snmp_port>] [-c <snmp_community>] [-s <sensor_number>] -k keyword [-W <warning_threshold>] [-C <critical_threshold]"
+  echo "Available options:"
+  echo "  -H   Host (IP address or FQDN)"
+  echo "  -p   SNMP Port (default: 161)"
+  echo "  -c   SNMP community (default: public)"
+  echo "  -s   Sensor number (default: 1)"
+  echo "  -k   Keyword (e.g. temperature, sensorState)"
+  echo "  -W   Warning threshold (e.g. 38.0)"
+  echo "  -C   Critical threshold (e.g. 40.0)"
+  echo "  -v   Print version information (to use alone to get the version of the plugin)"
+  exit 3
+}
+
+# Generate OID
+generate_oid() {
+  local base_oid=$1
+  local sensor_number=$2
+  echo "${base_oid}${sensor_number}"
+}
+
+# Options management
+while getopts H:p:c:s:k:W:C:v opt; do
+  case $opt in
+    H) HOST=$OPTARG ;;
+    p) PORT=$OPTARG ;;
+    c) COMMUNITY=$OPTARG ;;
+    s) SENSOR=$OPTARG ;;
+    k) KEYWORD=$OPTARG ;;
+    W) WARNING=$OPTARG ;;
+    C) CRITICAL=$OPTARG ;;
+    v) echo "$script - $author - $version"; exit ;;
+    \?) usage ;;
+  esac
+done
+
+# Needed arguments check
+if [[ -z $HOST || -z $KEYWORD ]]; then
+  usage
+fi
+
+# Calculate sensor OIDs
+ID_OID=$(generate_oid ${OID_BASES['sensorID']} $SENSOR)
+SENSOR_ID_OUTPUT=$(snmpget -v1 -c $COMMUNITY $HOST:$PORT $ID_OID -Ov -Oq | tr -d '"')
+
+# Check if sensor exists
+if [[ $SENSOR_ID_OUTPUT == "Error in packet"* ]]; then
+  echo "Invalid sensor number. The sensor does not exist."
+  exit 3
+fi
+
+OID=$(generate_oid ${OID_BASES[$KEYWORD]} $SENSOR)
+UNIT_OID=$(generate_oid ${OID_BASES['temperatureUnit']} $SENSOR)
+NAME_OID=$(generate_oid ${OID_BASES['sensorName']} $SENSOR)
+
+# Get sensor information
+SENSOR_NAME=$(snmpget -v1 -c $COMMUNITY $HOST:$PORT $NAME_OID -Ov -Oq | tr -d '"')
+UNIT_NUM=$(snmpget -v1 -c $COMMUNITY $HOST:$PORT $UNIT_OID -Ov -Oq | tr -d '"')
+SENSOR_VALUE=$(snmpget -v1 -c $COMMUNITY $HOST:$PORT $OID -Ov -Oq | tr -d '"')
+
+# If the keyword is "temperature", then SENSOR_VALUE needs to be reformatted to have one decimal point
+if [[ $KEYWORD == "temperature" ]]; then
+  SENSOR_VALUE=$(LC_ALL=C awk -v sensor="$SENSOR_VALUE" 'BEGIN {printf "%.1f", sensor}')
+fi
+
+UNIT_NAME=""
+case $UNIT_NUM in
+  1) UNIT_NAME="°C" ;; # Celsius
+  2) UNIT_NAME="°F" ;; # Farenheit
+  3) UNIT_NAME="K" ;; # Kelvin
+  4) UNIT_NAME="%" ;; # Only used for humidity sensors
+esac
+
+# Check thresholds
+if [[ $KEYWORD == "temperature" ]]; then
+  if [[ ! -z $CRITICAL && $(awk -v sensor="$SENSOR_VALUE" -v critical="$CRITICAL" 'BEGIN {print (sensor>=critical) ? "1" : "0"}') == "1" ]]; then
+    echo "CRITICAL - Sensor ID: $SENSOR_ID_OUTPUT (Name: $SENSOR_NAME) - $KEYWORD is $SENSOR_VALUE$UNIT_NAME. Action required."
+    exit 2
+  elif [[ ! -z $WARNING && $(awk -v sensor="$SENSOR_VALUE" -v warning="$WARNING" 'BEGIN {print (sensor>=warning) ? "1" : "0"}') == "1" ]]; then
+    echo "WARNING - Sensor ID: $SENSOR_ID_OUTPUT (Name: $SENSOR_NAME) - $KEYWORD is $SENSOR_VALUE$UNIT_NAME. Action potentially required."
+    exit 1
+  fi
+fi
+
+# Display sensor information
+echo "OK - Sensor ID: $SENSOR_ID_OUTPUT (Name: $SENSOR_NAME) - $KEYWORD is $SENSOR_VALUE$UNIT_NAME."
+
+exit 0
